@@ -1,1 +1,501 @@
+# -*- coding: utf-8 -*-
+"""
+RoBERTa + SEÇİLMİŞ metadata eğitimi
+Girdi: BASE_PATH/{train,val,test}_unified.pkl  (tek dosyada: user_id, label, text_*, selected features)
+Çıktı: metrikler + ROC/PR + CM + tablolar (Val/Test)
+"""
+
+import os, json, warnings
+warnings.filterwarnings("ignore")
+os.environ["TRANSFORMERS_NO_TF"] = "1"
+os.environ["TRANSFORMERS_NO_FLAX"] = "1"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import torch
+from torch import nn
+from torch.utils.data import Dataset
+import transformers as hf
+from transformers.training_args import IntervalStrategy
+from transformers import AutoModel, AutoTokenizer, Trainer
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, average_precision_score
+from datetime import datetime
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BASE_PATH = Path(r"C:\Users\hc\Desktop\depression_detection\bert adımları")
+RESULTS_DIR = Path("best_roberta_runs"); RESULTS_DIR.mkdir(exist_ok=True, parents=True)
+
+# --- Best ayarlar (senin config)
+BEST = {
+    "model": "roberta-base",
+    "text_type": "text_advanced",
+    "use_metadata": False,
+    "epochs": 3,
+    "batch_size": 8,
+    "learning_rate": 2e-05,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.1,
+    "mlp_attention_dim": 256,
+    "mlp_classifier_layers": [512, 256],
+    "mlp_dropout": 0.3
+}
+
+# --- META AZALTMA AYARLARI ---
+META_TOP_K = 20  # 120 → K (örn. 40). use_metadata=True ise train'de MI ile seçilir.
+
+from sklearn.feature_selection import mutual_info_classif
+
+def select_meta_topk_by_mi(df_train, meta_cols, k=META_TOP_K):
+    if k is None or k >= len(meta_cols):
+        return meta_cols, None
+    X = df_train[meta_cols].values.astype(np.float32)
+    y = df_train["label"].astype(int).values
+    mi = mutual_info_classif(X, y, discrete_features=False, random_state=42)
+    idx = np.argsort(mi)[::-1][:k]
+    keep = [meta_cols[i] for i in idx]
+    return keep, mi.tolist()
+
+def apply_meta_subset(df, text_col, keep_cols):
+    cols = ["user_id", "label", text_col] + keep_cols
+    return df[cols].copy(), keep_cols
+
+
+# ---------------------- Model ----------------------
+class BertHybridModel(nn.Module):
+    def __init__(self, bert_model_name='roberta-base', num_metadata_features=0,
+                 use_metadata=True, mlp_config=None):
+        super().__init__()
+        self.use_metadata = use_metadata
+        self.bert = AutoModel.from_pretrained(bert_model_name)
+        H = self.bert.config.hidden_size
+
+        if mlp_config is None:
+            mlp_config = {
+                "attention_dim": 256,
+                "metadata_hidden": 64,            # ↓ 128 → 64
+                "classifier_layers": [512, 256],
+                "dropout": 0.5                    # ↑ 0.3 → 0.5 (daha çok regularization)
+            }
+
+        # Attention pooling
+        self.attn_w1 = nn.Linear(H, mlp_config["attention_dim"])
+        self.attn_w2 = nn.Linear(mlp_config["attention_dim"], 1)
+        self.attn_dropout = nn.Dropout(mlp_config["dropout"])
+
+        # Metadata path
+        meta_proj_dim = 0
+        if use_metadata:
+            assert num_metadata_features > 0
+            layers = []
+            in_dim = num_metadata_features
+            for hidden_dim in [64, 32]:          # ↓ 128,64 yerine 64,32
+                layers += [
+                    nn.Linear(in_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(mlp_config["dropout"])
+                ]
+                in_dim = hidden_dim
+            self.metadata_processor = nn.Sequential(*layers)
+            meta_proj_dim = in_dim
+
+            # Öğrenilebilir gate (meta katkısını kıs)
+            self.meta_gate = nn.Parameter(torch.tensor(-1.0))  # sigmoid ≈ 0.27 başlangıç
+            self._gate_act = nn.Sigmoid()
+
+        # Classifier
+        in_cls = H + meta_proj_dim
+        clfs = []
+        for h in mlp_config["classifier_layers"]:
+            clfs += [
+                nn.Linear(in_cls, h),
+                nn.LayerNorm(h),
+                nn.ReLU(),
+                nn.Dropout(mlp_config["dropout"])
+            ]
+            in_cls = h
+        clfs += [nn.Linear(in_cls, 2)]
+        self.classifier = nn.Sequential(*clfs)
+        self.loss_fn = nn.CrossEntropyLoss()
+
+    def forward(self, input_ids, attention_mask, labels=None, metadata=None):
+        out = self.bert(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        last_hidden = out.last_hidden_state  # [B, T, H]
+
+        scores = self.attn_w2(self.attn_dropout(torch.tanh(self.attn_w1(last_hidden)))).squeeze(-1)
+        scores = scores.masked_fill(attention_mask == 0, float("-inf"))
+        scores = torch.nan_to_num(scores, nan=-1e4, posinf=1e4, neginf=-1e4)
+        attn = torch.softmax(scores, dim=1)
+        text_vec = torch.bmm(attn.unsqueeze(1), last_hidden).squeeze(1)
+
+        if self.use_metadata:
+            assert metadata is not None
+            meta_vec = self.metadata_processor(metadata)
+            g = self._gate_act(self.meta_gate)   # 0..1
+            meta_vec = g * meta_vec              # meta etkisini kıs
+            fused = torch.cat([text_vec, meta_vec], dim=1)
+        else:
+            fused = text_vec
+
+        fused = torch.nan_to_num(fused, nan=0.0, posinf=1e4, neginf=-1e4)
+        logits = self.classifier(fused)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_fn(logits, labels)
+            if torch.isnan(loss):
+                loss = (logits * 0.0).sum()
+
+        return {"loss": loss, "logits": logits}
+
+
+# ---------------------- Dataset ----------------------
+class DepressionDataset(Dataset):
+    def __init__(self, df, tokenizer, text_column, meta_cols=None, max_len=512):
+        self.df = df.reset_index(drop=True)
+        self.tokenizer = tokenizer
+        self.text_column = text_column
+        self.meta_cols = meta_cols or []
+        self.max_len = max_len
+
+    def __len__(self): return len(self.df)
+
+    def __getitem__(self, i):
+        row = self.df.iloc[i]
+        text = str(row[self.text_column])
+        enc = self.tokenizer.encode_plus(
+            text, add_special_tokens=True, max_length=self.max_len,
+            padding="max_length", truncation=True, return_tensors="pt"
+        )
+        item = {
+            "input_ids": enc["input_ids"].squeeze(0),
+            "attention_mask": enc["attention_mask"].squeeze(0),
+            "labels": torch.tensor(int(row["label"]), dtype=torch.long)
+        }
+        if len(self.meta_cols) > 0:
+            meta_values = row[self.meta_cols].values.astype(np.float32)
+            item["metadata"] = torch.tensor(meta_values, dtype=torch.float32)
+        return item
+
+# ---------------------- Metrics (safe) ----------------------
+def _proba_from_logits_safe(logits: np.ndarray) -> np.ndarray:
+    arr = np.asarray(logits)
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    t = torch.from_numpy(arr)
+    t = torch.nan_to_num(t, nan=0.0, posinf=1e4, neginf=-1e4)
+    t = t - t.max(dim=-1, keepdim=True).values
+    with torch.no_grad():
+        p = torch.softmax(t, dim=-1).cpu().numpy()
+    p1 = p[:, 1] if p.shape[1] > 1 else p[:, 0]
+    p1 = np.nan_to_num(p1, nan=0.5, posinf=1.0, neginf=0.0)
+    p1 = np.clip(p1, 1e-7, 1 - 1e-7)
+    return p1
+
+def compute_metrics(p):
+    from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, average_precision_score
+    logits = p.predictions[0] if isinstance(p.predictions, (tuple, list)) else p.predictions
+    labels = p.label_ids.astype(int)
+    proba = _proba_from_logits_safe(logits)
+    m = np.isfinite(proba)
+    if m.sum() == 0:
+        return {"accuracy":0.0,"precision":0.0,"recall":0.0,"f1":0.0,"auroc":0.0,"auprc":0.0}
+    y_true = labels[m]; y_prob = proba[m]; y_pred = (y_prob >= 0.5).astype(int)
+    acc  = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec  = recall_score(y_true, y_pred, zero_division=0)
+    f1   = f1_score(y_true, y_pred)
+    try: auc_roc = roc_auc_score(y_true, y_prob)
+    except Exception: auc_roc = 0.0
+    try: auc_pr  = average_precision_score(y_true, y_prob)
+    except Exception: auc_pr = 0.0
+    return {"accuracy":acc,"precision":prec,"recall":rec,"f1":f1,"auroc":auc_roc,"auprc":auc_pr}
+
+
+# K-değerini en iyi sonucunuz olan 20 olarak güncelliyoruz.
+META_TOP_K = 20 # K=20 en iyi potansiyel F1'i verdi.
+
+# ... compute_metrics fonksiyonundan sonra eklenecek ...
+
+def find_optimal_f1_threshold(y_true, y_prob):
+    """Validation setinde F1 skorunu maksimize eden eşiği bulur."""
+    from sklearn.metrics import precision_recall_curve
+    precisions, recalls, thresholds = precision_recall_curve(y_true, y_prob)
+    
+    # F-score = 2 * (Precision * Recall) / (Precision + Recall)
+    # NaN'lardan kaçınmak için 1e-9 eklenir
+    f_scores = (2 * precisions * recalls) / (precisions + recalls + 1e-9)
+    
+    # Maksimum F1'in indeksi (threshold'lar P/R'dan 1 eksiktir)
+    best_f1_idx = np.argmax(f_scores)
+    best_threshold = thresholds[best_f1_idx]
+    best_f1 = f_scores[best_f1_idx]
+    
+    return best_threshold, best_f1
+
+def compute_metrics_with_optimized_threshold(trainer, val_ds, test_ds):
+    """
+    1. Validation setinde en iyi F1 eşiğini bulur.
+    2. Bu eşiği Test setine uygulayıp Test@bestF1 skorunu raporlar.
+    """
+    # 1. Validation setinden olasılıkları topla
+    val_pred = trainer.predict(val_ds)
+    val_logits = val_pred.predictions[0] if isinstance(val_pred.predictions, (tuple, list)) else val_pred.predictions
+    val_y_true = val_pred.label_ids.astype(int)
+    val_y_prob = _proba_from_logits_safe(val_logits)
+
+    # 2. Validation'da en iyi F1 eşiğini bul
+    opt_thr, opt_f1_val = find_optimal_f1_threshold(val_y_true, val_y_prob)
+    
+    print(f"\n[Opt-Threshold] Validation'da En İyi F1 Eşiği: T={opt_thr:.4f}")
+    
+    # 3. Test setinden olasılıkları topla
+    test_pred = trainer.predict(test_ds)
+    test_logits = test_pred.predictions[0] if isinstance(test_pred.predictions, (tuple, list)) else test_pred.predictions
+    test_y_true = test_pred.label_ids.astype(int)
+    test_y_prob = _proba_from_logits_safe(test_logits)
+
+    # 4. Test setine optimize edilmiş eşiği uygula
+    test_y_pred_opt = (test_y_prob >= opt_thr).astype(int)
+
+    # 5. Yeni metrikleri hesapla
+    opt_metrics = {
+        "test@bestF1_thr": opt_thr,
+        "test@bestF1_f1": f1_score(test_y_true, test_y_pred_opt, zero_division=0),
+        "test@bestF1_P": precision_score(test_y_true, test_y_pred_opt, zero_division=0),
+        "test@bestF1_R": recall_score(test_y_true, test_y_pred_opt, zero_division=0),
+        "test@bestF1_Acc": accuracy_score(test_y_true, test_y_pred_opt),
+    }
+
+    return opt_metrics, test_y_true, test_y_pred_opt
+# ---------------------- Load unified & run ----------------------
+def load_unified(split: str, text_col: str):
+    use_meta = BEST.get("use_metadata", True)
+
+    # Dosya seçimi: metadata varsa hibrit K120; yoksa master
+    if use_meta:
+        if text_col == "text_standart":
+            pkl = BASE_PATH / f"{split}_hybrid_std_k120.pkl"
+        elif text_col == "text_advanced":
+            pkl = BASE_PATH / f"{split}_hybrid_adv_k120.pkl"
+        else:
+            raise ValueError(f"Geçersiz text_col: {text_col}")
+    else:
+        pkl = BASE_PATH / f"{split}_master_data.pkl"
+
+    if not pkl.exists():
+        raise FileNotFoundError(f"Yok: {pkl}")
+
+    df = pd.read_pickle(pkl)
+    df["user_id"] = df["user_id"].astype(str).str.strip()
+    df[text_col] = df[text_col].fillna("").astype(str)
+
+    if use_meta:
+        # Aktif metin + id + label dışındaki tüm kolonlar meta
+        drop = {"user_id", "label", text_col}
+        meta_cols = [c for c in df.columns if c not in drop]
+        # Temizlik
+        if meta_cols:
+            df[meta_cols] = (df[meta_cols]
+                             .replace([np.inf, -np.inf], np.nan)
+                             .fillna(0.0).astype(np.float32))
+        print(f"[OK] {split}: meta_cols={len(meta_cols)} | text_col={text_col}")
+    else:
+        meta_cols = []  # metadatasız
+        print(f"[OK] {split}: TEXT-ONLY | meta_cols=0 | text_col={text_col}")
+
+    return df, meta_cols
+
+
+
+
+def main():
+    text_col = BEST["text_type"]
+    df_tr, meta_cols = load_unified("train", text_col)
+    df_va, _         = load_unified("val",   text_col)
+    df_te, _         = load_unified("test",  text_col)
+
+    # --- META TOP-K (yalnızca use_metadata=True iken) ---
+    if BEST["use_metadata"] and len(meta_cols) > 0:
+        keep_cols, mi = select_meta_topk_by_mi(df_tr, meta_cols, k=META_TOP_K)
+        df_tr, meta_cols = apply_meta_subset(df_tr, text_col, keep_cols)
+        df_va, _         = apply_meta_subset(df_va, text_col, keep_cols)
+        df_te, _         = apply_meta_subset(df_te, text_col, keep_cols)
+
+        # küçük log
+        sel_dir = RESULTS_DIR / "meta_subset_info"
+        sel_dir.mkdir(parents=True, exist_ok=True)
+        with open(sel_dir/"meta_keep_cols.json","w",encoding="utf-8") as f:
+            json.dump({"k": META_TOP_K, "kept": keep_cols, "mi": mi}, f, indent=2, ensure_ascii=False)
+        print(f"[META] Kept {len(meta_cols)} features (K={META_TOP_K}). List saved to meta_subset_info/meta_keep_cols.json")
+    else:
+        print("[META] Disabled or no meta features.")
+
+    tok = AutoTokenizer.from_pretrained(BEST["model"])
+    train_ds = DepressionDataset(df_tr, tok, text_col, meta_cols=meta_cols)
+    val_ds   = DepressionDataset(df_va, tok, text_col, meta_cols=meta_cols)
+    test_ds  = DepressionDataset(df_te, tok, text_col, meta_cols=meta_cols)
+
+    model = BertHybridModel(
+        bert_model_name=BEST["model"],
+        num_metadata_features=len(meta_cols) if BEST["use_metadata"] else 0,
+        use_metadata=BEST["use_metadata"],
+        mlp_config={
+            "attention_dim": BEST["mlp_attention_dim"],
+            "metadata_hidden": 64,                    # küçük MLP
+            "classifier_layers": BEST["mlp_classifier_layers"],
+            "dropout": 0.5 if BEST["use_metadata"] else BEST["mlp_dropout"]  # meta açıkken daha çok dropout
+        }
+    ).to(DEVICE)
+
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    tag = "textonly" if not BEST["use_metadata"] else f"metaK{META_TOP_K}"
+    run_name = f"best_roberta_{tag}_{BEST['text_type']}_{run_stamp}"
+    out_dir = RESULTS_DIR / run_name
+
+
+    args = hf.TrainingArguments(
+        output_dir=str(out_dir),
+        num_train_epochs=BEST["epochs"],
+        per_device_train_batch_size=BEST["batch_size"],
+        per_device_eval_batch_size=16,
+        learning_rate=BEST["learning_rate"],
+        weight_decay=BEST["weight_decay"],
+        warmup_ratio=BEST["warmup_ratio"],
+        seed=42,
+        eval_strategy=IntervalStrategy.STEPS,
+        save_strategy=IntervalStrategy.STEPS,
+        eval_steps=100,
+        save_steps=100,
+        load_best_model_at_end=True,
+        metric_for_best_model="auroc",
+        greater_is_better=True,
+        remove_unused_columns=False,
+        report_to=[],
+        fp16=False,              # NaN kaynaklarını kesmek için şimdilik kapalı
+        max_grad_norm=1.0,       # grad clip
+        logging_strategy=IntervalStrategy.NO,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        tokenizer=tok,
+        compute_metrics=compute_metrics
+    )
+
+    print("\n================= EĞİTİM BAŞLIYOR (RoBERTa + unified metadata) =================")
+    trainer.train()
+    print("===============================================================================\n")
+
+    print("📊 Validation (T=0.5):")
+    val_out = trainer.evaluate(val_ds)
+    val_metrics = {k.replace("eval_", ""): float(v) for k, v in val_out.items()}
+    print({k: round(v, 4) for k, v in val_metrics.items()})
+
+    print("\n🧪 Test (T=0.5):")
+    test_out = trainer.evaluate(test_ds)
+    test_metrics = {k.replace("eval_", ""): float(v) for k, v in test_out.items()}
+    print({k: round(v, 4) for k, v in test_metrics.items()})
+
+    opt_metrics, test_y_true_opt, test_y_pred_opt = compute_metrics_with_optimized_threshold(trainer, val_ds, test_ds)
+
+    print("\n🏆 Test (@bestF1 Eşik Optimizasyonu):")
+    print({k: round(v, 4) for k, v in opt_metrics.items()})
+    
+    # Tabloya Ekleme ve Kayıt
+    final_metrics = test_metrics.copy()
+    final_metrics.update(opt_metrics)
+
+    # ---- Yayın-dostu şekiller/tablolar
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc, precision_recall_curve
+
+    FIG_DIR = out_dir / "figures"; FIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    def eval_and_collect(tr, ds, split):
+        po = tr.predict(ds)
+        logits = po.predictions[0] if isinstance(po.predictions, (tuple, list)) else po.predictions
+        y_true = po.label_ids.astype(int)
+        y_prob = _proba_from_logits_safe(logits)
+        m = np.isfinite(y_prob)
+        y_true = y_true[m]; y_prob = y_prob[m]
+        y_pred = (y_prob >= 0.5).astype(int)
+        acc  = accuracy_score(y_true, y_pred)
+        prec = precision_score(y_true, y_pred, zero_division=0)
+        rec  = recall_score(y_true, y_pred, zero_division=0)
+        f1   = f1_score(y_true, y_pred)
+        try: rocA = roc_auc_score(y_true, y_prob)
+        except Exception: rocA = 0.0
+        try:
+            pr_prec, pr_rec, _ = precision_recall_curve(y_true, y_prob)
+            prA = auc(pr_rec, pr_prec)
+        except Exception:
+            pr_prec = pr_rec = np.array([0,1]); prA = 0.0
+        cm = confusion_matrix(y_true, y_pred)
+        cls = classification_report(y_true, y_pred, target_names=["No Depression","Depression"], output_dict=True, zero_division=0)
+        return {"split":split,"y_true":y_true,"y_pred":y_pred,"y_prob":y_prob,"cm":cm,
+                "acc":acc,"precision":prec,"recall":rec,"f1":f1,"roc_auc":rocA,"pr_auc":prA,
+                "pr_curve":(pr_rec, pr_prec)}
+
+    res_val = eval_and_collect(trainer, val_ds, "val")
+    res_tst = eval_and_collect(trainer, test_ds, "test")
+
+    # ROC
+    plt.figure(figsize=(7,6))
+    for res, lab, col in [(res_val,"Validation","#2E86AB"), (res_tst,"Test","#06A77D")]:
+        fpr, tpr, _ = roc_curve(res["y_true"], res["y_prob"])
+        aucv = auc(fpr, tpr)
+        plt.plot(fpr, tpr, lw=2, label=f"{lab} (AUC={aucv:.3f})")
+    plt.plot([0,1],[0,1],"--", lw=1, color="gray")
+    plt.xlabel("FPR"); plt.ylabel("TPR"); plt.title("ROC Curves"); plt.legend(); plt.grid(alpha=0.3)
+    plt.tight_layout(); plt.savefig(FIG_DIR/"roc_curves.png"); plt.savefig(FIG_DIR/"roc_curves.pdf"); plt.close()
+
+    # PR
+    plt.figure(figsize=(7,6))
+    for res, lab, col in [(res_val,"Validation","#2E86AB"), (res_tst,"Test","#06A77D")]:
+        r, p = res["pr_curve"]
+        plt.plot(r, p, lw=2, label=f"{lab} (AUC={res['pr_auc']:.3f})")
+    plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title("Precision–Recall Curves")
+    plt.legend(); plt.grid(alpha=0.3)
+    plt.tight_layout(); plt.savefig(FIG_DIR/"pr_curves.png"); plt.savefig(FIG_DIR/"pr_curves.pdf"); plt.close()
+
+    # Confusion matrices
+    fig, axes = plt.subplots(1,2, figsize=(12,5))
+    for ax, res, title, cmap in [
+        (axes[0], res_val, f"Validation\nF1={res_val['f1']:.3f} | ROC-AUC={res_val['roc_auc']:.3f}", "Blues"),
+        (axes[1], res_tst, f"Test\nF1={res_tst['f1']:.3f} | ROC-AUC={res_tst['roc_auc']:.3f}", "Greens")
+    ]:
+        sns.heatmap(res["cm"], annot=True, fmt="d", cmap=cmap, cbar=False,
+                    xticklabels=["NoDep","Dep"], yticklabels=["NoDep","Dep"], ax=ax)
+        ax.set_xlabel("Predicted"); ax.set_ylabel("True"); ax.set_title(title)
+    plt.tight_layout(); plt.savefig(FIG_DIR/"confusion_matrices.png"); plt.savefig(FIG_DIR/"confusion_matrices.pdf"); plt.close()
+
+    # Tablo/JSON özet
+    pd.DataFrame([
+        {"split":"validation","accuracy":res_val["acc"],"precision":res_val["precision"],"recall":res_val["recall"],"f1":res_val["f1"],"auroc":res_val["roc_auc"],"auprc":res_val["pr_auc"]},
+        {"split":"test","accuracy":res_tst["acc"],"precision":res_tst["precision"],"recall":res_tst["recall"],"f1":res_tst["f1"],"auroc":res_tst["roc_auc"],"auprc":res_tst["pr_auc"]},
+    ]).to_csv(out_dir/"metrics_summary.csv", index=False)
+
+    with open(out_dir/"summary.json","w",encoding="utf-8") as f:
+        json.dump({
+            "config": BEST,
+            "meta_dim": len(meta_cols),
+            "val": {k:float(v) for k,v in res_val.items() if isinstance(v,(int,float,np.floating))},
+            "test":{k:float(v) for k,v in res_tst.items() if isinstance(v,(int,float,np.floating))},
+            "run_dir": str(out_dir)
+        }, f, indent=2, ensure_ascii=False)
+
+    print("\n✅ Bitti. Sonuçlar ve figürler:", out_dir)
+
+if __name__ == "__main__":
+    main()
 
