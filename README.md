@@ -30,6 +30,8 @@ Two preprocessing strategies are evaluated:
 ### Models
 The following models are implemented and evaluated:
 - BERT-base
+- Roberta-Base
+- DistilBert
 - MentalBERT
 - Longformer
 - BigBird
