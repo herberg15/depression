@@ -185,3 +185,223 @@ print("İŞLEM TAMAMLANDI!")
 print(f"Tüm .json dosyalarına 'clean_text_standart' ve 'clean_text_advanced' alanları eklendi.")
 print(f"Toplam geçen süre: {end_time - start_time:.2f} saniye.")
 print("="*65)
+
+
+
+
+import os, json, shutil, random
+from pathlib import Path
+from collections import defaultdict, Counter
+
+# =========================
+# AYARLAR
+# =========================
+BASE_DIR   = Path(r"C:\Users\hc\Desktop\depression_detection\bert adımları")
+SRC_POS    = BASE_DIR / "pozitive"
+SRC_NEG    = BASE_DIR / "negative"
+
+DEST_TRAIN = BASE_DIR / "train"
+DEST_VAL   = BASE_DIR / "val"
+DEST_TEST  = BASE_DIR / "test"
+
+DROPPED    = BASE_DIR / "train_dropped"   # train undersampling'de çıkan fazlalar buraya taşınır
+SEED       = 42
+
+random.seed(SEED)
+
+# =========================
+# YARDIMCI FONKSİYONLAR
+# =========================
+def clean_and_make_dirs():
+    for root in [DEST_TRAIN, DEST_VAL, DEST_TEST]:
+        for cls in ["pozitive", "negative"]:
+            d = root / cls
+            if d.exists():
+                shutil.rmtree(d)
+            d.mkdir(parents=True, exist_ok=True)
+
+def read_user_id_from_json(fp: Path) -> str | None:
+    """
+    JSONL veya satır satır JSON dosyalarında ilk geçerli satırdan common key'lerle user_id okur.
+    """
+    try:
+        with open(fp, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                for k in ("user_id","userid","uid","author_id"):
+                    v = obj.get(k, None)
+                    if v is not None and str(v).strip():
+                        return str(v).strip()
+                # bazen user id nested olabilir; istersen buraya ek kural yazılabilir
+                break
+    except Exception:
+        pass
+    return None
+
+def fallback_user_id_from_filename(fp: Path) -> str:
+    # Son çare: filename gövdesi (ama asıl amaç JSON içini kullanmak)
+    stem = fp.stem
+    return stem.split("created_at")[0] if "created_at" in stem else stem
+
+def get_user_id(fp: Path) -> str:
+    uid = read_user_id_from_json(fp)
+    return uid if uid else fallback_user_id_from_filename(fp)
+
+def scan_class_folder(src_dir: Path) -> dict[str, list[Path]]:
+    """
+    Sınıf klasörünü tarar: user_id -> [dosyalar]
+    """
+    bucket = defaultdict(list)
+    for p in src_dir.iterdir():
+        if p.is_file() and p.suffix.lower()==".json":
+            uid = get_user_id(p)
+            bucket[uid].append(p)
+    return bucket
+
+def copy_files(files: list[Path], dst: Path):
+    dst.mkdir(parents=True, exist_ok=True)
+    for fp in files:
+        shutil.copy2(fp, dst / fp.name)
+
+def move_files(files: list[Path], dst: Path):
+    dst.mkdir(parents=True, exist_ok=True)
+    for fp in files:
+        shutil.move(str(fp), str(dst / fp.name))
+
+def count_files(d: Path) -> int:
+    return len(list(d.glob("*.json")))
+
+def user_sets_in_split(root: Path) -> tuple[set[str], set[str], set[str]]:
+    def users_in(dir_):
+        s = set()
+        for fp in dir_.glob("*.json"):
+            s.add(get_user_id(fp))
+        return s
+    return users_in(root / "pozitive"), users_in(root / "negative"), users_in(root)  # sonuncusu tümü
+
+# =========================
+# USER-LEVEL 80/10/10 (DOSYA HEDEFİNE GREEDY)
+# =========================
+def user_level_split_by_file_targets(user2files: dict[str, list[Path]], r_train=0.8, r_val=0.1, r_test=0.1):
+    """
+    Her kullanıcı tek split'e atanır. Hedef: toplam dosya sayısı oranlarını yakalamak.
+    Greedy: her adımda dosya sayısı hedeften en eksik olan split'e kullanıcıyı koy.
+    """
+    # hedef dosya sayısı
+    total_files = sum(len(v) for v in user2files.values())
+    t_train = round(total_files * r_train)
+    t_val   = round(total_files * r_val)
+    t_test  = total_files - t_train - t_val
+
+    # kullanıcıları rastgele sırala (deterministik seed için listeyi dışarıda kar)
+    items = list(user2files.items())
+    random.Random(SEED).shuffle(items)
+
+    # sayaçlar
+    cur = {"train":0, "val":0, "test":0}
+    T   = {"train":t_train, "val":t_val, "test":t_test}
+    assign = {"train":[], "val":[], "test":[]}
+
+    def need_ratio(split):  # ne kadar eksik: cur/target oranı (düşük olan daha eksik)
+        # target 0 olamaz ama guard koyuyoruz
+        tgt = max(T[split], 1)
+        return cur[split]/tgt
+
+    for uid, files in items:
+        # en çok eksik olan split’e ata
+        split = min(("train","val","test"), key=need_ratio)
+        assign[split].append(uid)
+        cur[split] += len(files)
+
+    return assign, T, cur
+
+# =========================
+# ANA AKIŞ
+# =========================
+print("▶ Hedef klasörler temizleniyor/oluşturuluyor...")
+clean_and_make_dirs()
+
+# 1) Kaynakları tara (user -> dosyalar)
+pos_u2f = scan_class_folder(SRC_POS)
+neg_u2f = scan_class_folder(SRC_NEG)
+
+print(f"[INFO] poz users: {len(pos_u2f)} | neg users: {len(neg_u2f)}")
+print(f"[INFO] poz files: {sum(len(v) for v in pos_u2f.values())} | neg files: {sum(len(v) for v in neg_u2f.values())}")
+
+# 2) Sınıf bazında user-level split (dosya hedefli)
+pos_assign, pos_target, pos_cur = user_level_split_by_file_targets(pos_u2f, 0.8, 0.1, 0.1)
+neg_assign, neg_target, neg_cur = user_level_split_by_file_targets(neg_u2f, 0.8, 0.1, 0.1)
+
+print("[TARGET poz] train/val/test:", pos_target, " | [actual after assign]:", pos_cur)
+print("[TARGET neg] train/val/test:", neg_target, " | [actual after assign]:", neg_cur)
+
+# 3) Kopyala
+copy_files([f for u in pos_assign["train"] for f in pos_u2f[u]], DEST_TRAIN / "pozitive")
+copy_files([f for u in pos_assign["val"]   for f in pos_u2f[u]], DEST_VAL   / "pozitive")
+copy_files([f for u in pos_assign["test"]  for f in pos_u2f[u]], DEST_TEST  / "pozitive")
+
+copy_files([f for u in neg_assign["train"] for f in neg_u2f[u]], DEST_TRAIN / "negative")
+copy_files([f for u in neg_assign["val"]   for f in neg_u2f[u]], DEST_VAL   / "negative")
+copy_files([f for u in neg_assign["test"]  for f in neg_u2f[u]], DEST_TEST  / "negative")
+
+print("\n--- SPLIT SONRASI (dosya sayıları) ---")
+print("TRAIN/pozitive:", count_files(DEST_TRAIN / "pozitive"))
+print("TRAIN/negative:", count_files(DEST_TRAIN / "negative"))
+print("VAL/pozitive  :", count_files(DEST_VAL   / "pozitive"))
+print("VAL/negative  :", count_files(DEST_VAL   / "negative"))
+print("TEST/pozitive :", count_files(DEST_TEST  / "pozitive"))
+print("TEST/negative :", count_files(DEST_TEST  / "negative"))
+
+# 4) Overlap kontrolü (user-level) — her split kendi içinde pos/neg birleşimi
+tr_pos_u, tr_neg_u, tr_all = user_sets_in_split(DEST_TRAIN)
+va_pos_u, va_neg_u, va_all = user_sets_in_split(DEST_VAL)
+te_pos_u, te_neg_u, te_all = user_sets_in_split(DEST_TEST)
+
+def report_overlap(a: set[str], b: set[str], name: str):
+    inter = a & b
+    print(f"[OVERLAP] {name}: {len(inter)}")
+    if inter:
+        print("  örnekler:", list(sorted(inter))[:10])
+
+print("\n[USER OVERLAP KONTROL]")
+report_overlap(tr_all, va_all, "train∩val")
+report_overlap(tr_all, te_all, "train∩test")
+report_overlap(va_all, te_all, "val∩test")
+
+# 5) SADECE TRAIN için dosya-bazlı UNDERSAMPLING (poz=neg eşit dosya sayısı)
+print("\n▶ TRAIN undersampling (dosya sayısı eşitleme)...")
+train_pos_files = list((DEST_TRAIN / "pozitive").glob("*.json"))
+train_neg_files = list((DEST_TRAIN / "negative").glob("*.json"))
+n_pos, n_neg = len(train_pos_files), len(train_neg_files)
+target = min(n_pos, n_neg)
+
+def undersample_dir_keep_target(dir_path: Path, target_n: int, dropped_subdir: Path):
+    files = list(dir_path.glob("*.json"))
+    if len(files) <= target_n:
+        return 0
+    random.Random(SEED).shuffle(files)
+    keep = set(files[:target_n])
+    drop = [f for f in files if f not in keep]
+    move_files(drop, dropped_subdir)
+    return len(drop)
+
+dropped_pos = dropped_neg = 0
+if n_pos > target:
+    dropped_pos = undersample_dir_keep_target(DEST_TRAIN / "pozitive", target, DROPPED / "pozitive")
+if n_neg > target:
+    dropped_neg = undersample_dir_keep_target(DEST_TRAIN / "negative", target, DROPPED / "negative")
+
+print(f"[DONE] dropped -> poz:{dropped_pos} | neg:{dropped_neg}")
+print("\n=== FİNAL (TRAIN balanced, VAL/TEST sabit) ===")
+print("TRAIN/pozitive:", count_files(DEST_TRAIN / "pozitive"))
+print("TRAIN/negative:", count_files(DEST_TRAIN / "negative"))
+print("VAL/pozitive  :", count_files(DEST_VAL   / "pozitive"))
+print("VAL/negative  :", count_files(DEST_VAL   / "negative"))
+print("TEST/pozitive :", count_files(DEST_TEST  / "pozitive"))
+print("TEST/negative :", count_files(DEST_TEST  / "negative"))
+
