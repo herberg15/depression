@@ -1,1 +1,1170 @@
+# -*- coding: utf-8 -*-
+"""
+BERT + Attention Pooling + Metadata Fusion + Sınıflandırma
+Amac: 
+1. BERT/BigBird ile text'i fine-tune et
+2. Attention mechanism ile token'ları pool et
+3. Metadata ile fusion yap (learnable gate)
+4. Sınıflandır (depresyon/normal)
 
+Girdi: BASE_PATH/{train,val,test}_master_data.pkl
+Çıktı: ROC/PR curves, CM, threshold analizi, feature importance, attention viz
+"""
+
+import os, json, warnings
+warnings.filterwarnings("ignore")
+os.environ["TRANSFORMERS_NO_TF"] = "1"
+os.environ["TRANSFORMERS_NO_FLAX"] = "1"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import torch
+from torch import nn
+from torch.utils.data import Dataset
+
+# Transformers - Önce temel modülleri import et
+import transformers as hf
+
+# Sonra spesifik class'ları import et (sıralama önemli!)
+from transformers import AutoTokenizer  # Önce tokenizer
+from transformers import BertModel, RobertaModel, DistilBertModel, LongformerModel, BigBirdModel # BigBirdModel eklendi
+from transformers import Trainer
+from transformers.trainer_callback import TrainerCallback
+from transformers.training_args import IntervalStrategy
+
+from sklearn.metrics import (accuracy_score, f1_score, precision_score, recall_score, 
+                             roc_auc_score, average_precision_score, confusion_matrix, 
+                             classification_report, roc_curve, auc, precision_recall_curve)
+from datetime import datetime
+
+# AutoModel wrapper fonksiyonu (GenerationMixin hatasını bypass eder)
+def load_bert_model(model_name):
+    """Model ismine göre uygun model sınıfını yükle (uzun dizi modellerini de kapsayacak şekilde)"""
+    model_lower = model_name.lower()
+    if "roberta" in model_lower and "bigbird" not in model_lower: # bigbird-roberta'ı dışlar
+        print(f"   [MODEL] Loading RoBERTa model: {model_name}")
+        return RobertaModel.from_pretrained(model_name)
+    elif "distilbert" in model_lower:
+        print(f"   [MODEL] Loading DistilBERT model: {model_name}")
+        return DistilBertModel.from_pretrained(model_name)
+    elif "longformer" in model_lower:
+        print(f"   [MODEL] Loading Longformer model: {model_name}")
+        return LongformerModel.from_pretrained(model_name)
+    elif "bigbird" in model_lower:
+        print(f"   [MODEL] Loading BigBird model: {model_name}")
+        return BigBirdModel.from_pretrained(model_name)
+    else: # BERT modelleri (BERT, BERTweet) için
+        print(f"   [MODEL] Loading BERT-based model: {model_name}")
+        return BertModel.from_pretrained(model_name)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BASE_PATH = Path(r"C:\Users\hc\Desktop\depression_detection\bert adımları")
+RESULTS_DIR = Path("best_mental/allenai/longformer-base-4096") # BigBird için yeni klasör
+RESULTS_DIR.mkdir(exist_ok=True, parents=True)
+
+# ==================== BEST CONFIG ====================
+BEST = {
+    # Model & Data
+    "model": "allenai/longformer-base-4096", # BigBird modeli
+    "text_type": "text_advanced", # Veya text_standart
+    "use_metadata": True,
+    "max_length": 4096, # BigBird için uygun uzunluk
+    
+    # Training - 4096 token uzunluğunda büyük bir batch size hafızayı aşıyor olabilir
+    # Gradient accumulation steps ile etkili batch size'ı koruyabilirsiniz.
+    "epochs": 3,
+    "batch_size": 1, # GPU hafızasına bağlı olarak ayarlayın, BigBird bile hesaplamaları yoğunlaştırır
+    "learning_rate": 2e-05,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.1,
+    "gradient_accumulation_steps": 8,  # Efektif batch size = 1 * 8 = 8 olur (örnek)
+    "max_grad_norm": 1.0,
+    "fp16": True,  # FP16 hafızayı azaltabilir ve hız artırabilir, ama model uyumlu olmalı
+  
+    # Architecture - BERT Text Pooling
+    "use_attention_pooling": True,  # ✅ YENİ: False ise [CLS] token kullanılır
+    "pooling_attention_dim": 256,   # ✅ İSİM DEĞİŞTİ: Attention pooling hidden dim
+    
+    # Architecture - Metadata MLP
+    "mlp_metadata_layers": [128, 64],  # Metadata feature'ları için MLP
+    
+    # Architecture - Classifier
+    "mlp_classifier_layers": [512, 256],  # Final classification MLP
+    "mlp_dropout": 0.3,
+    
+    # Early Stopping
+    "early_stopping_patience": 3,
+    "early_stopping_threshold": 0.001,
+    
+    # Evaluation
+    "eval_steps": 100,
+    "save_steps": 100,
+    "metric_for_best_model": "auroc",  # veya "f1"
+}
+
+META_TOP_K = None  # Tüm metadata kullan
+
+# ==================== EARLY STOPPING CALLBACK ====================
+class EarlyStoppingCallback(TrainerCallback):
+    def __init__(self, patience=3, threshold=0.001):
+        self.patience = patience
+        self.threshold = threshold
+        self.best_metric = None
+        self.wait = 0
+        
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if metrics is None:
+            return control
+            
+        metric_name = f"eval_{args.metric_for_best_model}"
+        current_metric = metrics.get(metric_name)
+        
+        if current_metric is None:
+            return control
+            
+        if self.best_metric is None:
+            self.best_metric = current_metric
+        elif current_metric > self.best_metric + self.threshold:
+            self.best_metric = current_metric
+            self.wait = 0
+        else:
+            self.wait += 1
+            if self.wait >= self.patience:
+                print(f"\n⚠️ Early stopping: {self.patience} evals without improvement")
+                control.should_training_stop = True
+                
+        return control
+
+# ==================== MODEL ====================
+class BertHybridModel(nn.Module):
+    """
+    Hibrit Model Mimarisi:
+    1. BERT/BigBird: Text encoding (fine-tuned)
+    2. ATTENTION POOLING: Token'lardan cümle vektörü oluştur (depresif kelimelere odaklan)
+    3. METADATA MLP: Metadata feature'larını işle
+    4. FUSION: Text + Metadata birleştir (learnable gate)
+    5. CLASSIFIER: Binary classification (depresyon/normal)
+    """
+    def __init__(self, bert_model_name='google/bigbird-roberta-base', 
+                 num_metadata_features=0, use_metadata=True, mlp_config=None):
+        super().__init__()
+        self.use_metadata = use_metadata
+        self.use_attention_pooling = mlp_config.get("use_attention_pooling", True) if mlp_config else True
+        
+        # BERT model - AutoModel yerine direkt load_bert_model kullan
+        self.bert = load_bert_model(bert_model_name)
+        H = self.bert.config.hidden_size  # 768 for BigBird-RoBERTa-base
+
+        if mlp_config is None:
+            mlp_config = {
+                "use_attention_pooling": True,
+                "pooling_attention_dim": 256,
+                "metadata_layers": [128, 64],
+                "classifier_layers": [512, 256],
+                "dropout": 0.3
+            }
+
+        # ===== 1. TEXT POOLING =====
+        # Amaç: BigBird'ün 4096 token çıktısını tek bir vektöre indirgemek
+        if self.use_attention_pooling:
+            # ATTENTION POOLING: Önemli token'lara (depresif kelimeler) daha fazla ağırlık ver
+            # Örnek: "I am" (ağırlık: 0.01) vs "want to die" (ağırlık: 0.45)
+            self.attn_w1 = nn.Linear(H, mlp_config["pooling_attention_dim"])
+            self.attn_w2 = nn.Linear(mlp_config["pooling_attention_dim"], 1)
+            self.attn_dropout = nn.Dropout(mlp_config["dropout"])
+            print(f"   [POOLING] Using Attention Pooling (dim={mlp_config['pooling_attention_dim']})")
+        else:
+            # ALTERNATIVE: Sadece [CLS] token kullan (BigBird'ün sentence embedding'i)
+            print(f"   [POOLING] Using [CLS] token (no attention)")
+
+        # ===== 2. METADATA PROCESSOR =====
+        meta_proj_dim = 0
+        if use_metadata:
+            assert num_metadata_features > 0, "Metadata kullanıyorsan feature sayısı > 0 olmalı"
+            
+            layers = []
+            in_dim = num_metadata_features
+            for hidden_dim in mlp_config["metadata_layers"]:
+                layers += [
+                    nn.Linear(in_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(mlp_config["dropout"])
+                ]
+                in_dim = hidden_dim
+            self.metadata_processor = nn.Sequential(*layers)
+            meta_proj_dim = in_dim
+
+            # ===== 3. LEARNABLE GATE (Fusion control) =====
+            # Amaç: Metadata'nın etkisini öğrenilebilir şekilde ayarla
+            # sigmoid(0) = 0.5 → text ve metadata başlangıçta eşit ağırlıklı
+            self.meta_gate = nn.Parameter(torch.tensor(0.0))
+            self._gate_act = nn.Sigmoid()
+            print(f"   [FUSION] Learnable gate initialized (sigmoid(0)=0.5)")
+
+        # ===== 4. CLASSIFIER =====
+        in_cls = H + meta_proj_dim
+        clfs = []
+        for h in mlp_config["classifier_layers"]:
+            clfs += [
+                nn.Linear(in_cls, h),
+                nn.LayerNorm(h),
+                nn.ReLU(),
+                nn.Dropout(mlp_config["dropout"])
+            ]
+            in_cls = h
+        clfs += [nn.Linear(in_cls, 2)]
+        self.classifier = nn.Sequential(*clfs)
+        
+        # ===== 5. LOSS =====
+        self.loss_fn = nn.CrossEntropyLoss()
+
+    def forward(self, input_ids, attention_mask, labels=None, metadata=None,return_attention=False, global_attention_mask=None):
+        # BERT/BigBird encoding
+        # BigBird için global_attention_mask kullan
+        model_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "return_dict": True
+        }
+        if global_attention_mask is not None:
+            model_kwargs["global_attention_mask"] = global_attention_mask
+
+        out = self.bert(**model_kwargs)
+        last_hidden = out.last_hidden_state  # [B, T, H] → [batch_size, 4096_tokens, 768_dim]
+
+        # TEXT POOLING: [B, T, H] → [B, H]
+        if self.use_attention_pooling:
+            # Attention-based pooling (depresif token'lara odaklan)
+            scores = self.attn_w2(self.attn_dropout(torch.tanh(self.attn_w1(last_hidden)))).squeeze(-1)  # [B, T]
+            scores = scores.masked_fill(attention_mask == 0, float("-inf"))  # Padding token'ları maskele
+            scores = torch.nan_to_num(scores, nan=-1e4, posinf=1e4, neginf=-1e4)
+            attn_weights = torch.softmax(scores, dim=1)  # [B, T] → Attention ağırlıkları
+            text_vec = torch.bmm(attn_weights.unsqueeze(1), last_hidden).squeeze(1)  # [B, H]
+        else:
+            # [CLS] token pooling (basit, hızlı)
+            text_vec = last_hidden[:, 0, :]  # [B, H]
+
+        # METADATA FUSION
+        if self.use_metadata:
+            assert metadata is not None, "Metadata=None ama use_metadata=True!"
+            meta_vec = self.metadata_processor(metadata)  # [B, meta_proj_dim]
+            
+            gate = self._gate_act(self.meta_gate)  # Learnable fusion weight [0, 1]
+            meta_vec = gate * meta_vec  # Metadata etkisini ayarla
+            
+            fused = torch.cat([text_vec, meta_vec], dim=1)  # [B, H+meta_proj_dim]
+        else:
+            fused = text_vec
+
+        # CLASSIFICATION
+        fused = torch.nan_to_num(fused, nan=0.0, posinf=1e4, neginf=-1e4)
+        logits = self.classifier(fused)  # [B, 2]
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        # LOSS
+        loss = None
+        if labels is not None:
+            loss = self.loss_fn(logits, labels)
+            if torch.isnan(loss):
+                loss = (logits * 0.0).sum()  # Fallback for NaN
+
+        # DÖNÜŞÜM - attention_weights isteniyorsa ekle
+        result = {"loss": loss, "logits": logits}
+        if self.use_attention_pooling and return_attention:
+            result["attention_weights"] = attn_weights
+
+        return result
+# ==================== DATASET ====================
+class DepressionDataset(Dataset):
+    def __init__(self, df, tokenizer, text_column, meta_cols=None, max_len=512):
+        self.df = df.reset_index(drop=True)
+        self.tokenizer = tokenizer
+        self.text_column = text_column
+        self.meta_cols = meta_cols or []
+        self.max_len = max_len
+
+    def __len__(self): 
+        return len(self.df)
+
+    def __getitem__(self, i):
+        row = self.df.iloc[i]
+        text = str(row[self.text_column])
+        
+        enc = self.tokenizer.encode_plus(
+            text, 
+            add_special_tokens=True, 
+            max_length=self.max_len,
+            padding="max_length", 
+            truncation=True, 
+            return_tensors="pt", 
+            return_attention_mask=True
+        )
+        
+        item = {
+            "input_ids": enc["input_ids"].squeeze(0),
+            "attention_mask": enc["attention_mask"].squeeze(0),
+            "labels": torch.tensor(int(row["label"]), dtype=torch.long)
+        }
+        
+        # BigBird için global_attention_mask ekle (opsiyonel ama önerilir)
+        # [CLS] tokenına (genellikle indeks 0) global dikkat ver
+        # [CLS] token'ının indeksini bul
+        # google/bigbird-roberta-base için cls_token_id = 2 (Roberta tokenizer'ı kullanır)
+        cls_id = self.tokenizer.cls_token_id # Genellikle 2 (RobertaBase'den türediği için)
+        input_ids_np = item["input_ids"].numpy()
+        cls_indices = (input_ids_np == cls_id).astype(int)
+        item["global_attention_mask"] = torch.tensor(cls_indices, dtype=torch.long)
+
+        if len(self.meta_cols) > 0:
+            meta_values = row[self.meta_cols].values.astype(np.float32)
+            item["metadata"] = torch.tensor(meta_values, dtype=torch.float32)
+            
+        return item
+
+# ==================== METRICS ====================
+def _proba_from_logits_safe(logits: np.ndarray) -> np.ndarray:
+    """Logits -> Probability (safe)"""
+    arr = np.asarray(logits)
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    t = torch.from_numpy(arr)
+    t = torch.nan_to_num(t, nan=0.0, posinf=1e4, neginf=-1e4)
+    t = t - t.max(dim=-1, keepdim=True).values
+    with torch.no_grad():
+        p = torch.softmax(t, dim=-1).cpu().numpy()
+    p1 = p[:, 1] if p.shape[1] > 1 else p[:, 0]
+    p1 = np.nan_to_num(p1, nan=0.5, posinf=1.0, neginf=0.0)
+    p1 = np.clip(p1, 1e-7, 1 - 1e-7)
+    return p1
+
+def compute_metrics(p):
+    """Trainer için metric callback"""
+    logits = p.predictions[0] if isinstance(p.predictions, (tuple, list)) else p.predictions
+    labels = p.label_ids.astype(int)
+    proba = _proba_from_logits_safe(logits)
+    
+    m = np.isfinite(proba)
+    if m.sum() == 0:
+        return {"accuracy":0.0,"precision":0.0,"recall":0.0,"f1":0.0,"auroc":0.0,"auprc":0.0}
+    
+    y_true = labels[m]
+    y_prob = proba[m]
+    y_pred = (y_prob >= 0.5).astype(int)
+    
+    acc  = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec  = recall_score(y_true, y_pred, zero_division=0)
+    f1   = f1_score(y_true, y_pred)
+    
+    try: 
+        auc_roc = roc_auc_score(y_true, y_prob)
+    except: 
+        auc_roc = 0.0
+        
+    try: 
+        auc_pr = average_precision_score(y_true, y_prob)
+    except: 
+        auc_pr = 0.0
+        
+    return {
+        "accuracy": acc,
+        "precision": prec,
+        "recall": rec,
+        "f1": f1,
+        "auroc": auc_roc,
+        "auprc": auc_pr
+    }
+
+# ==================== DATA LOADING ====================
+def load_unified(split: str, text_col: str):
+    """Tek dosya sistemi: {split}_master_data.pkl"""
+    pkl = BASE_PATH / f"{split}_master_data.pkl"
+    
+    if not pkl.exists():
+        raise FileNotFoundError(f"❌ Dosya bulunamadı: {pkl}")
+
+    df = pd.read_pickle(pkl)
+    df["user_id"] = df["user_id"].astype(str).str.strip()
+    df[text_col] = df[text_col].fillna("").astype(str)
+
+    use_meta = BEST.get("use_metadata", True)
+    
+    if use_meta:
+        # Metadata sütunları: user_id, label, text_* dışındakiler
+        drop = {"user_id", "label", "text_standart", "text_advanced"}
+        meta_cols = [c for c in df.columns if c not in drop]
+        
+        if meta_cols:
+            df[meta_cols] = (df[meta_cols]
+                             .replace([np.inf, -np.inf], np.nan)
+                             .fillna(0.0)
+                             .astype(np.float32))
+        print(f"✅ [{split:5s}] Loaded: {len(df):5d} samples | {len(meta_cols):3d} meta features | text={text_col}")
+    else:
+        meta_cols = []
+        print(f"✅ [{split:5s}] Loaded: {len(df):5d} samples | TEXT-ONLY mode")
+
+    return df, meta_cols
+
+# ==================== VISUALIZATION ====================
+def visualize_attention_weights(model, tokenizer, texts, labels, meta_data, out_dir, top_k=5):
+    """
+    Attention weights görselleştir (en yüksek ağırlıklı token'lar)
+    
+    Args:
+        model: Trained BertHybridModel
+        tokenizer: Tokenizer
+        texts: List of text samples
+        labels: List of labels (0/1)
+        meta_data: Metadata tensor or None
+        out_dir: Output directory
+        top_k: Kaç örnek gösterilecek
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    
+    model.eval()
+    device = next(model.parameters()).device
+    
+    VIZ_DIR = out_dir / "attention_viz"
+    VIZ_DIR.mkdir(parents=True, exist_ok=True)
+    
+    results = []
+    
+    with torch.no_grad():
+        for idx, (text, label) in enumerate(zip(texts[:top_k], labels[:top_k])):
+            # Tokenize
+            enc = tokenizer.encode_plus(
+                text, 
+                add_special_tokens=True,
+                max_length=BEST["max_length"], # max_len yerine BEST["max_length"] kullan
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+                return_attention_mask=True
+            )
+            
+            input_ids = enc["input_ids"].to(device)
+            attention_mask = enc["attention_mask"].to(device)
+            # global_attention_mask ekle
+            cls_id = tokenizer.cls_token_id
+            input_ids_np = input_ids.cpu().numpy()
+            cls_indices = (input_ids_np == cls_id).astype(int)
+            global_attention_mask = torch.tensor(cls_indices, dtype=torch.long).to(device)
+            
+            # Get metadata if available
+            metadata = None
+            if meta_data is not None and len(meta_data) > idx:
+                metadata = meta_data[idx].unsqueeze(0).to(device)
+            
+            # Forward pass with attention
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                global_attention_mask=global_attention_mask, # Eklendi
+                metadata=metadata,
+                return_attention=True
+            )
+            
+            if "attention_weights" not in outputs:
+                print("⚠️  Attention weights not available (use_attention_pooling=False?)")
+                return
+            
+            attn_weights = outputs["attention_weights"][0].cpu().numpy()  # [T]
+            logits = outputs["logits"][0].cpu().numpy()
+            pred_prob = torch.softmax(torch.tensor(logits), dim=0)[1].item()
+            
+            # Get tokens
+            tokens = tokenizer.convert_ids_to_tokens(input_ids[0].cpu().numpy())
+            mask = attention_mask[0].cpu().numpy()
+            
+            # Filter padding
+            valid_tokens = [t for t, m in zip(tokens, mask) if m == 1]
+            valid_weights = attn_weights[:len(valid_tokens)]
+            
+            # Top-10 important tokens
+            top_indices = np.argsort(valid_weights)[-10:][::-1]
+            top_tokens = [valid_tokens[i] for i in top_indices]
+            top_weights = [valid_weights[i] for i in top_indices]
+            
+            results.append({
+                "text": text,
+                "label": "Depressed" if label == 1 else "Non-Depressed",
+                "pred_prob": pred_prob,
+                "top_tokens": list(zip(top_tokens, top_weights))
+            })
+            
+            # Visualization: Heatmap (sadece ilk 100 token gösterilir okunabilirlik için)
+            display_tokens = valid_tokens[:100]
+            display_weights = valid_weights[:100]
+            
+            if len(display_tokens) == 0:
+                print(f"⚠️  Sample {idx+1}: No valid tokens to display.")
+                continue
+            
+            fig, ax = plt.subplots(figsize=(15, 3)) # Genişliği artır
+            
+            # Create heatmap
+            im = ax.imshow([display_weights], cmap="YlOrRd", aspect="auto", vmin=0, vmax=display_weights.max())
+            
+            # Set ticks
+            ax.set_xticks(np.arange(len(display_tokens)))
+            ax.set_xticklabels(display_tokens, rotation=90, fontsize=6) # Font boyutunu küçült
+            ax.set_yticks([])
+            
+            # Title
+            title = f"Sample {idx+1} | True: {results[-1]['label']} | Pred Prob: {pred_prob:.3f}"
+            ax.set_title(title, fontsize=10, fontweight='bold') # Font boyutunu küçült
+            
+            # Colorbar
+            cbar = plt.colorbar(im, ax=ax, orientation='horizontal', pad=0.2)
+            cbar.set_label('Attention Weight', fontsize=8)
+            
+            plt.tight_layout()
+            plt.savefig(VIZ_DIR / f"attention_sample_{idx+1}.png", dpi=300, bbox_inches='tight')
+            plt.close()
+    
+    # Save text summary
+    with open(VIZ_DIR / "attention_summary.txt", "w", encoding="utf-8") as f:
+        for i, res in enumerate(results):
+            f.write(f"\n{'='*80}\n")
+            f.write(f"SAMPLE {i+1}\n")
+            f.write(f"{'='*80}\n")
+            f.write(f"Text: {res['text'][:200]}...\n")
+            f.write(f"True Label: {res['label']}\n")
+            f.write(f"Predicted Prob (Depressed): {res['pred_prob']:.4f}\n")
+            f.write(f"\nTop-10 Important Tokens:\n")
+            for token, weight in res['top_tokens']:
+                f.write(f"  {token:20s} → {weight:.4f}\n")
+    
+    print(f"\n📊 Attention weights visualized: {VIZ_DIR}")
+    print(f"   - {top_k} heatmaps created")
+    print(f"   - attention_summary.txt saved")
+
+def find_optimal_threshold(y_true, y_prob, metric='f1'):
+    """
+    Belirli bir metrik için optimal eşik değerini bulur.
+    
+    Args:
+        y_true: Gerçek etiketler (0, 1)
+        y_prob: Modelin pozitif sınıf olasılığı (float)
+        metric: 'f1', 'precision', 'recall', 'accuracy', 'f1_weighted'
+    
+    Returns:
+        optimal_threshold, best_score
+    """
+    thresholds = np.linspace(0.01, 0.99, 99)  # 0.01'den 0.99'a kadar
+    scores = []
+    
+    for th in thresholds:
+        y_pred = (y_prob >= th).astype(int)
+        
+        if metric == 'f1':
+            score = f1_score(y_true, y_pred, zero_division=0)
+        elif metric == 'precision':
+            score = precision_score(y_true, y_pred, zero_division=0)
+        elif metric == 'recall':
+            score = recall_score(y_true, y_pred, zero_division=0)
+        elif metric == 'accuracy':
+            score = accuracy_score(y_true, y_pred)
+        elif metric == 'f1_weighted':
+            score = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+        else:
+            raise ValueError(f"Unknown metric: {metric}")
+            
+        scores.append(score)
+    
+    best_idx = np.argmax(scores)
+    best_threshold = thresholds[best_idx]
+    best_score = scores[best_idx]
+    
+    return best_threshold, best_score
+
+def create_publication_figures(trainer, val_ds, test_ds, out_dir, res_val, res_tst):
+    """Makale kalitesinde grafikler"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    
+    # Set publication style
+    plt.style.use('seaborn-v0_8-paper')
+    sns.set_palette("Set2")
+    
+    FIG_DIR = out_dir / "figures"
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # ===== 1. ROC CURVES =====
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for res, lab, color in [(res_val, "Validation", "#2E86AB"), (res_tst, "Test", "#A23B72")]:
+        fpr, tpr, _ = roc_curve(res["y_true"], res["y_prob"])
+        aucv = auc(fpr, tpr)
+        ax.plot(fpr, tpr, lw=2.5, label=f"{lab} (AUC={aucv:.3f})", color=color)
+    
+    ax.plot([0,1], [0,1], "--", lw=1.5, color="gray", label="Chance")
+    ax.set_xlabel("False Positive Rate", fontsize=12)
+    ax.set_ylabel("True Positive Rate", fontsize=12)
+    ax.set_title("ROC Curves", fontsize=14, fontweight='bold')
+    ax.legend(fontsize=11, loc='lower right')
+    ax.grid(alpha=0.3, linestyle='--')
+    plt.tight_layout()
+    plt.savefig(FIG_DIR/"roc_curves.png", dpi=300)
+    plt.savefig(FIG_DIR/"roc_curves.pdf", dpi=300)
+    plt.close()
+    
+    # ===== 2. PRECISION-RECALL CURVES =====
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for res, lab, color in [(res_val, "Validation", "#2E86AB"), (res_tst, "Test", "#A23B72")]:
+        r, p = res["pr_curve"]
+        ax.plot(r, p, lw=2.5, label=f"{lab} (AUC={res['pr_auc']:.3f})", color=color)
+    
+    ax.set_xlabel("Recall", fontsize=12)
+    ax.set_ylabel("Precision", fontsize=12)
+    ax.set_title("Precision-Recall Curves", fontsize=14, fontweight='bold')
+    ax.legend(fontsize=11, loc='lower left')
+    ax.grid(alpha=0.3, linestyle='--')
+    plt.tight_layout()
+    plt.savefig(FIG_DIR/"pr_curves.png", dpi=300)
+    plt.savefig(FIG_DIR/"pr_curves.pdf", dpi=300)
+    plt.close()
+    
+    # ===== 3. CONFUSION MATRICES (Side by Side) =====
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    for ax, res, title, cmap in [
+        (axes[0], res_val, f"Validation\nF1={res_val['f1']:.3f} | AUC={res_val['roc_auc']:.3f}", "Blues"),
+        (axes[1], res_tst, f"Test\nF1={res_tst['f1']:.3f} | AUC={res_tst['roc_auc']:.3f}", "Greens")
+    ]:
+        sns.heatmap(res["cm"], annot=True, fmt="d", cmap=cmap, cbar=False,
+                    xticklabels=["Non-Depressed", "Depressed"], 
+                    yticklabels=["Non-Depressed", "Depressed"], 
+                    ax=ax, annot_kws={"size": 14})
+        ax.set_xlabel("Predicted Label", fontsize=12)
+        ax.set_ylabel("True Label", fontsize=12)
+        ax.set_title(title, fontsize=13, fontweight='bold')
+    
+    plt.tight_layout()
+    plt.savefig(FIG_DIR/"confusion_matrices.png", dpi=300)
+    plt.savefig(FIG_DIR/"confusion_matrices.pdf", dpi=300)
+    plt.close()
+    
+    # ===== 4. THRESHOLD ANALYSIS (F1 vs Threshold) =====
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    for ax, res, title in [(axes[0], res_val, "Validation"), (axes[1], res_tst, "Test")]:
+        thresholds = np.linspace(0.1, 0.9, 50)
+        f1_scores = []
+        precisions = []
+        recalls = []
+        
+        for t in thresholds:
+            y_pred_t = (res["y_prob"] >= t).astype(int)
+            f1_scores.append(f1_score(res["y_true"], y_pred_t))
+            precisions.append(precision_score(res["y_true"], y_pred_t, zero_division=0))
+            recalls.append(recall_score(res["y_true"], y_pred_t, zero_division=0))
+        
+        ax.plot(thresholds, f1_scores, 'o-', label='F1-Score', linewidth=2)
+        ax.plot(thresholds, precisions, 's-', label='Precision', linewidth=2)
+        ax.plot(thresholds, recalls, '^-', label='Recall', linewidth=2)
+        
+        best_idx = np.argmax(f1_scores)
+        ax.axvline(thresholds[best_idx], color='red', linestyle='--', 
+                   label=f'Best T={thresholds[best_idx]:.2f}')
+        
+        ax.set_xlabel('Threshold', fontsize=12)
+        ax.set_ylabel('Score', fontsize=12)
+        ax.set_title(f'{title} Set', fontsize=13, fontweight='bold')
+        ax.legend(fontsize=10)
+        ax.grid(alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(FIG_DIR/"threshold_analysis.png", dpi=300)
+    plt.savefig(FIG_DIR/"threshold_analysis.pdf", dpi=300)
+    plt.close()
+    
+    # ===== 5. METRICS COMPARISON (Bar Chart) =====
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    metrics_data = {
+        'Accuracy': [res_val['acc'], res_tst['acc']],
+        'Precision': [res_val['precision'], res_tst['precision']],
+        'Recall': [res_val['recall'], res_tst['recall']],
+        'F1-Score': [res_val['f1'], res_tst['f1']],
+        'ROC-AUC': [res_val['roc_auc'], res_tst['roc_auc']],
+        'PR-AUC': [res_val['pr_auc'], res_tst['pr_auc']]
+    }
+    
+    x = np.arange(len(metrics_data))
+    width = 0.35
+    
+    val_scores = [v[0] for v in metrics_data.values()]
+    test_scores = [v[1] for v in metrics_data.values()]
+    
+    bars1 = ax.bar(x - width/2, val_scores, width, label='Validation', color='#2E86AB')
+    bars2 = ax.bar(x + width/2, test_scores, width, label='Test', color='#A23B72')
+    
+    ax.set_ylabel('Score', fontsize=12)
+    ax.set_title('Performance Metrics Comparison', fontsize=14, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(metrics_data.keys(), fontsize=11)
+    ax.legend(fontsize=11)
+    ax.grid(axis='y', alpha=0.3)
+    ax.set_ylim([0, 1.05])
+    
+    # Add value labels on bars
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{height:.3f}', ha='center', va='bottom', fontsize=9)
+    
+    plt.tight_layout()
+    plt.savefig(FIG_DIR/"metrics_comparison.png", dpi=300)
+    plt.savefig(FIG_DIR/"metrics_comparison.pdf", dpi=300)
+    plt.close()
+    
+    print(f"\n📊 5 adet grafik oluşturuldu: {FIG_DIR}")
+
+# ==================== MAIN ====================
+def main():
+    print("\n" + "="*80)
+    print("🚀 BIGBIRD + ATTENTION POOLING + METADATA FUSION TRAINING")
+    print("="*80 + "\n")
+    
+    text_col = BEST["text_type"]
+    
+    # 1. Load data
+    print("📂 Loading data...")
+    df_tr, meta_cols = load_unified("train", text_col)
+    df_va, _         = load_unified("val",   text_col)
+    df_te, _         = load_unified("test",  text_col)
+    
+    # 2. Feature selection (optional)
+    if BEST["use_metadata"] and len(meta_cols) > 0:
+        if META_TOP_K is not None:
+            from sklearn.feature_selection import mutual_info_classif
+            X = df_tr[meta_cols].values
+            y = df_tr["label"].values
+            mi_scores = mutual_info_classif(X, y, random_state=42)
+            mi_dict = dict(zip(meta_cols, mi_scores))
+            sorted_features = sorted(mi_dict.items(), key=lambda x: x[1], reverse=True)
+            meta_cols = [f[0] for f in sorted_features[:META_TOP_K]]
+            print(f"\n🔍 Feature Selection: Top-{META_TOP_K} features selected")
+            print(f"   Top-5: {meta_cols[:5]}")
+        else:
+            print(f"\n🔍 Feature Selection: Using ALL {len(meta_cols)} metadata features")
+    else:
+        meta_cols = []
+        print("\n⚠️  TEXT-ONLY mode (no metadata)")
+    
+    # 3. Tokenizer + Special tokens
+    #from transformers import BigBirdTokenizer
+    print("\n🔤 Loading tokenizer...")
+    tok = AutoTokenizer.from_pretrained(BEST["model"])
+    
+    special_new_tokens = []
+    for tkn in ["@user", "HTTPURL"]:
+        if tkn not in tok.get_vocab():
+            special_new_tokens.append(tkn)
+    
+    if special_new_tokens:
+        tok.add_tokens(special_new_tokens)
+        print(f"   ✅ Added new tokens: {special_new_tokens}")
+    else:
+        print(f"   ✅ Special tokens already in vocab")
+    
+    # 4. Create datasets
+    print("\n📦 Creating datasets...")
+    train_ds = DepressionDataset(df_tr, tok, text_col, meta_cols, BEST["max_length"])
+    val_ds   = DepressionDataset(df_va, tok, text_col, meta_cols, BEST["max_length"])
+    test_ds  = DepressionDataset(df_te, tok, text_col, meta_cols, BEST["max_length"])
+    print(f"   Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
+    
+    # 5. Build model
+    print("\n🏗️  Building model...")
+    model = BertHybridModel(
+        bert_model_name=BEST["model"],
+        num_metadata_features=len(meta_cols),
+        use_metadata=BEST["use_metadata"],
+        mlp_config={
+            "use_attention_pooling": BEST["use_attention_pooling"],
+            "pooling_attention_dim": BEST["pooling_attention_dim"],
+            "metadata_layers": BEST["mlp_metadata_layers"],
+            "classifier_layers": BEST["mlp_classifier_layers"],
+            "dropout": BEST["mlp_dropout"]
+        }
+    ).to(DEVICE)
+    
+    # Resize embeddings
+    try:
+        model.bert.resize_token_embeddings(len(tok))
+        print(f"   ✅ Embedding size updated: {len(tok)}")
+    except Exception as e:
+        print(f"   ⚠️  Resize failed: {e}")
+    
+    # Model summary
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    H = model.bert.config.hidden_size
+    print(f"   📊 Total params: {total_params:,} | Trainable: {trainable_params:,} | Hidden: {H}")
+    
+    # 6. Training setup
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    tag = "textonly" if not BEST["use_metadata"] else f"meta{len(meta_cols)}"
+    run_name = f"bigbird_attn_fusion_{tag}_{run_stamp}"
+    out_dir = RESULTS_DIR / run_name
+    
+    args = hf.TrainingArguments(
+        output_dir=str(out_dir),
+        num_train_epochs=BEST["epochs"],
+        per_device_train_batch_size=BEST["batch_size"],
+        per_device_eval_batch_size=2, # Daha düşük eval batch size
+        gradient_accumulation_steps=BEST["gradient_accumulation_steps"],
+        learning_rate=BEST["learning_rate"],
+        weight_decay=BEST["weight_decay"],
+        warmup_ratio=BEST["warmup_ratio"],
+        max_grad_norm=BEST["max_grad_norm"],
+        fp16=BEST["fp16"],
+        seed=42,
+        eval_strategy=IntervalStrategy.STEPS,
+        save_strategy=IntervalStrategy.STEPS,
+        eval_steps=BEST["eval_steps"],
+        save_steps=BEST["save_steps"],
+        load_best_model_at_end=True,
+        metric_for_best_model=BEST["metric_for_best_model"],
+        greater_is_better=True,
+        remove_unused_columns=False,
+        report_to=[],
+        logging_strategy=IntervalStrategy.STEPS,
+        logging_steps=50,
+    )
+    
+    # Early stopping callback
+    callbacks = [
+        EarlyStoppingCallback(
+            patience=BEST["early_stopping_patience"],
+            threshold=BEST["early_stopping_threshold"]
+        )
+    ]
+    
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        tokenizer=tok,
+        compute_metrics=compute_metrics,
+        callbacks=callbacks
+    )
+    
+    # 7. Train
+    print("\n" + "="*80)
+    print("🎯 TRAINING STARTED")
+    print("="*80)
+    print(f"Model: {BEST['model']}")
+    print(f"Metadata features: {len(meta_cols)}")
+    print(f"Epochs: {BEST['epochs']} | Batch size: {BEST['batch_size']} | LR: {BEST['learning_rate']}")
+    print(f"Device: {DEVICE}")
+    print("="*80 + "\n")
+    
+    trainer.train()
+    
+    print("\n" + "="*80)
+    print("✅ TRAINING COMPLETED")
+    print("="*80 + "\n")
+    
+    # 8. Evaluation
+    print("📊 Evaluating on Validation set (threshold=0.5)...")
+    val_out = trainer.evaluate(val_ds)
+    val_metrics = {k.replace("eval_", ""): float(v) for k, v in val_out.items()}
+    print("   " + " | ".join([f"{k}: {v:.4f}" for k, v in val_metrics.items()]))
+    
+    print("\n🧪 Evaluating on Test set (threshold=0.5)...")
+    test_out = trainer.evaluate(test_ds)
+    test_metrics = {k.replace("eval_", ""): float(v) for k, v in test_out.items()}
+    print("   " + " | ".join([f"{k}: {v:.4f}" for k, v in test_metrics.items()]))
+    
+    # 9. Detailed evaluation with predictions
+    def eval_and_collect(tr, ds, split_name):
+        """Detaylı evaluation + predictions"""
+        po = tr.predict(ds)
+        logits = po.predictions[0] if isinstance(po.predictions, (tuple, list)) else po.predictions
+        y_true = po.label_ids.astype(int)
+        y_prob = _proba_from_logits_safe(logits)
+        
+        # Filter valid predictions
+        m = np.isfinite(y_prob)
+        y_true = y_true[m]
+        y_prob = y_prob[m]
+        y_pred = (y_prob >= 0.5).astype(int)
+        
+        # Metrics
+        acc  = accuracy_score(y_true, y_pred)
+        prec = precision_score(y_true, y_pred, zero_division=0)
+        rec  = recall_score(y_true, y_pred, zero_division=0)
+        f1   = f1_score(y_true, y_pred)
+        
+        try:
+            rocA = roc_auc_score(y_true, y_prob)
+        except:
+            rocA = 0.0
+            
+        try:
+            pr_prec, pr_rec, _ = precision_recall_curve(y_true, y_prob)
+            prA = auc(pr_rec, pr_prec)
+        except:
+            pr_prec = pr_rec = np.array([0, 1])
+            prA = 0.0
+        
+        cm = confusion_matrix(y_true, y_pred)
+        cls_report = classification_report(
+            y_true, y_pred, 
+            target_names=["Non-Depressed", "Depressed"],
+            output_dict=True,
+            zero_division=0
+        )
+        
+        return {
+            "split": split_name,
+            "y_true": y_true,
+            "y_pred": y_pred,
+            "y_prob": y_prob,
+            "cm": cm,
+            "acc": acc,
+            "precision": prec,
+            "recall": rec,
+            "f1": f1,
+            "roc_auc": rocA,
+            "pr_auc": prA,
+            "pr_curve": (pr_rec, pr_prec),
+            "classification_report": cls_report
+        }
+    
+    print("\n📈 Collecting detailed predictions...")
+    res_val = eval_and_collect(trainer, val_ds, "validation")
+    res_tst = eval_and_collect(trainer, test_ds, "test")
+    
+    # 9.5. EŞİK OPTİMİZASYONU (✅ YENİ)
+    print("\n🔍 Optimizing threshold on validation set...")
+    optimal_threshold_f1, best_f1_val = find_optimal_threshold(res_val["y_true"], res_val["y_prob"], metric='f1')
+    optimal_threshold_acc, best_acc_val = find_optimal_threshold(res_val["y_true"], res_val["y_prob"], metric='accuracy')
+    optimal_threshold_prec, best_prec_val = find_optimal_threshold(res_val["y_true"], res_val["y_prob"], metric='precision')
+    optimal_threshold_rec, best_rec_val = find_optimal_threshold(res_val["y_true"], res_val["y_prob"], metric='recall')
+    
+    print(f"   F1 için optimal eşik: {optimal_threshold_f1:.4f} (Val F1: {best_f1_val:.4f})")
+    print(f"   Accuracy için optimal eşik: {optimal_threshold_acc:.4f} (Val Acc: {best_acc_val:.4f})")
+    print(f"   Precision için optimal eşik: {optimal_threshold_prec:.4f} (Val Prec: {best_prec_val:.4f})")
+    print(f"   Recall için optimal eşik: {optimal_threshold_rec:.4f} (Val Rec: {best_rec_val:.4f})")
+    
+    # En iyi F1'e göre test seti tahminleri
+    y_pred_opt_f1 = (res_tst["y_prob"] >= optimal_threshold_f1).astype(int)
+    opt_f1_test = f1_score(res_tst["y_true"], y_pred_opt_f1)
+    opt_acc_test = accuracy_score(res_tst["y_true"], y_pred_opt_f1)
+    opt_prec_test = precision_score(res_tst["y_true"], y_pred_opt_f1)
+    opt_rec_test = recall_score(res_tst["y_true"], y_pred_opt_f1)
+    opt_cm_test = confusion_matrix(res_tst["y_true"], y_pred_opt_f1)
+    
+    print(f"\n📊 Test Metrics with optimized threshold (F1: {optimal_threshold_f1:.4f}):")
+    print(f"   Accuracy:  {opt_acc_test:.4f}")
+    print(f"   Precision: {opt_prec_test:.4f}")
+    print(f"   Recall:    {opt_rec_test:.4f}")
+    print(f"   F1-Score:  {opt_f1_test:.4f}")
+    
+    # 10. Save results
+    print("\n💾 Saving results...")
+    
+    # Metrics summary CSV
+    metrics_df = pd.DataFrame([
+        {
+            "split": "validation",
+            "accuracy": res_val["acc"],
+            "precision": res_val["precision"],
+            "recall": res_val["recall"],
+            "f1": res_val["f1"],
+            "auroc": res_val["roc_auc"],
+            "auprc": res_val["pr_auc"]
+        },
+        {
+            "split": "test",
+            "accuracy": res_tst["acc"],
+            "precision": res_tst["precision"],
+            "recall": res_tst["recall"],
+            "f1": res_tst["f1"],
+            "auroc": res_tst["roc_auc"],
+            "auprc": res_tst["pr_auc"]
+        },
+        {
+            "split": "test_optimized_f1",
+            "accuracy": opt_acc_test,
+            "precision": opt_prec_test,
+            "recall": opt_rec_test,
+            "f1": opt_f1_test,
+            "auroc": res_tst["roc_auc"],  # ROC-AUC threshold bağımsız
+            "auprc": res_tst["pr_auc"]    # PR-AUC threshold bağımsız
+        }
+    ])
+    metrics_df.to_csv(out_dir / "metrics_summary.csv", index=False)
+    
+    # Classification reports
+    with open(out_dir / "classification_report_val.txt", "w") as f:
+        f.write(classification_report(
+            res_val["y_true"], res_val["y_pred"],
+            target_names=["Non-Depressed", "Depressed"]
+        ))
+    
+    with open(out_dir / "classification_report_test.txt", "w") as f:
+        f.write(classification_report(
+            res_tst["y_true"], res_tst["y_pred"],
+            target_names=["Non-Depressed", "Depressed"]
+        ))
+    
+    # JSON summary
+    summary = {
+        "config": BEST,
+        "model_info": {
+            "name": BEST["model"],
+            "total_params": total_params,
+            "trainable_params": trainable_params,
+            "metadata_features": len(meta_cols),
+            "vocab_size": len(tok)
+        },
+        "data_info": {
+            "train_size": len(train_ds),
+            "val_size": len(val_ds),
+            "test_size": len(test_ds),
+            "text_column": text_col
+        },
+        "validation": {
+            "accuracy": float(res_val["acc"]),
+            "precision": float(res_val["precision"]),
+            "recall": float(res_val["recall"]),
+            "f1": float(res_val["f1"]),
+            "auroc": float(res_val["roc_auc"]),
+            "auprc": float(res_val["pr_auc"])
+        },
+        "test": {
+            "accuracy": float(res_tst["acc"]),
+            "precision": float(res_tst["precision"]),
+            "recall": float(res_tst["recall"]),
+            "f1": float(res_tst["f1"]),
+            "auroc": float(res_tst["roc_auc"]),
+            "auprc": float(res_tst["pr_auc"])
+        },
+        "test_optimized_f1": {
+            "threshold": float(optimal_threshold_f1),
+            "accuracy": float(opt_acc_test),
+            "precision": float(opt_prec_test),
+            "recall": float(opt_rec_test),
+            "f1": float(opt_f1_test),
+            "auroc": float(res_tst["roc_auc"]), # ROC-AUC threshold bağımsız
+            "auprc": float(res_tst["pr_auc"])   # PR-AUC threshold bağımsız
+        },
+        "run_info": {
+            "run_name": run_name,
+            "output_dir": str(out_dir),
+            "timestamp": run_stamp
+        }
+    }
+    
+    with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    
+    # 11. Create publication-quality figures
+    print("\n🎨 Creating publication figures...")
+    create_publication_figures(trainer, val_ds, test_ds, out_dir, res_val, res_tst)
+    
+    # 11.5 ATTENTION VISUALIZATION (✅ YENİ - DÜZELTİLDİ)
+    if BEST["use_attention_pooling"]:
+        print("\n🔍 Visualizing attention weights...")
+        # Test setinden 5 depresif + 5 normal örnek seç
+        df_test_viz = df_te.copy()
+        dep_samples = df_test_viz[df_test_viz["label"] == 1].head(5)
+        non_dep_samples = df_test_viz[df_test_viz["label"] == 0].head(5)
+        viz_samples = pd.concat([dep_samples, non_dep_samples])
+        
+        viz_texts = viz_samples[text_col].tolist()
+        viz_labels = viz_samples["label"].tolist()
+        viz_meta = None
+        if BEST["use_metadata"] and len(meta_cols) > 0:
+            viz_meta = torch.tensor(viz_samples[meta_cols].values, dtype=torch.float32)
+        
+        visualize_attention_weights(
+            model=model,
+            tokenizer=tok,
+            texts=viz_texts,
+            labels=viz_labels,
+            meta_data=viz_meta,
+            out_dir=out_dir,
+            top_k=10
+        )
+    else:
+        print("\n⚠️  Attention pooling is disabled, skipping visualization.")
+
+    # 12. Save predictions
+    predictions_val = pd.DataFrame({
+        "y_true": res_val["y_true"],
+        "y_pred": res_val["y_pred"],
+        "y_prob": res_val["y_prob"]
+    })
+    predictions_val.to_csv(out_dir / "predictions_val.csv", index=False)
+    
+    predictions_test = pd.DataFrame({
+        "y_true": res_tst["y_true"],
+        "y_pred": res_tst["y_pred"],
+        "y_prob": res_tst["y_prob"]
+    })
+    predictions_test.to_csv(out_dir / "predictions_test.csv", index=False)
+    
+    # 12.5 Save optimized predictions
+    predictions_test_opt = pd.DataFrame({
+        "y_true": res_tst["y_true"],
+        "y_pred": y_pred_opt_f1,
+        "y_prob": res_tst["y_prob"],
+        "threshold_used": optimal_threshold_f1
+    })
+    predictions_test_opt.to_csv(out_dir / "predictions_test_optimized.csv", index=False)
+    
+    # 13. Final summary
+    print("\n" + "="*80)
+    print("🎉 ALL DONE!")
+    print("="*80)
+    print(f"\n📁 Results saved to: {out_dir}")
+    print(f"\n📊 Final Test Metrics (threshold=0.5):")
+    print(f"   Accuracy:  {res_tst['acc']:.4f}")
+    print(f"   Precision: {res_tst['precision']:.4f}")
+    print(f"   Recall:    {res_tst['recall']:.4f}")
+    print(f"   F1-Score:  {res_tst['f1']:.4f}")
+    print(f"   ROC-AUC:   {res_tst['roc_auc']:.4f}")
+    print(f"   PR-AUC:    {res_tst['pr_auc']:.4f}")
+    print(f"\n📊 Optimized Test Metrics (threshold={optimal_threshold_f1:.4f}):")
+    print(f"   Accuracy:  {opt_acc_test:.4f}")
+    print(f"   Precision: {opt_prec_test:.4f}")
+    print(f"   Recall:    {opt_rec_test:.4f}")
+    print(f"   F1-Score:  {opt_f1_test:.4f}")
+    print("\n" + "="*80 + "\n")
+
+if __name__ == "__main__":
+    # ==================== ABLATION STUDY MOD ====================
+    # Attention pooling ile/without karşılaştırma yapmak için:
+    # 
+    # 1. İlk çalıştırma (Attention pooling VAR):
+    #    python script.py
+    # 
+    # 2. İkinci çalıştırma (Attention pooling YOK):
+    #    Aşağıdaki satırı uncomment et:
+    #    BEST["use_attention_pooling"] = False
+    # 
+    # 3. İki run'ın sonuçlarını karşılaştır:
+    #    - best_roberta_metaX_text_advanced_TIMESTAMP1/ (with attention)
+    #    - best_roberta_metaX_text_advanced_TIMESTAMP2/ (without attention)
+    
+    # Ablation için uncomment et:
+    # BEST["use_attention_pooling"] = False
+    # BEST["eval_steps"] = 50  # Daha hızlı test için
+    # BEST["epochs"] = 2
+    
+    main()
