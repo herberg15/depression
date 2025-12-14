@@ -46,16 +46,4 @@ Metadata features are fused with Transformer-based representations in a hybrid a
 
 ---
 
-## Repository Structure
 
-```text
-depression-detection-longcontext/
-├── preprocessing/      # AC and SC preprocessing scripts
-├── features/           # Behavioral metadata extraction
-├── models/             # Transformer model implementations
-├── experiments/        # Training and evaluation scripts
-├── evaluation/         # Metrics, ROC/PR curves, SHAP analysis
-├── configs/            # Configuration files
-├── data/               # Data directory (no raw data included)
-├── requirements.txt
-└── README.md
