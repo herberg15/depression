@@ -1,1 +1,243 @@
+import json
+from pathlib import Path
+import re
+from collections import OrderedDict
+import pandas as pd
+import numpy as np
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+import textstat
+from gensim import corpora
+from gensim.models.ldamulticore import LdaMulticore
+import zoneinfo
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.feature_selection import mutual_info_classif
+import pyLDAvis
+import pyLDAvis.gensim_models as gensimvis
 
+# ========================= CONFIG =================================
+BASE_PATH = Path(r"C:\Users\hc\Desktop\depression_detection\bert adımları")
+CLEANED_JSONS = BASE_PATH / "cleaned_jsons"
+OUTPUT_DIR = BASE_PATH / "paper_metadata_outputs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+NUM_TOPICS = 20
+NO_ABOVE = 0.5
+MIN_DOC_FREQ = 5
+
+SPLITS = ["train", "val", "test"]
+LABEL_DIRS = ["pozitive", "negative"]
+
+STOPWORDS = set(stopwords.words("english"))
+lemmatizer = WordNetLemmatizer()
+
+print("\n>>> Pipeline started...")
+
+# ========================= HELPERS =================================
+def safe_load_json_lines(path: Path):
+    """JSON Lines veya JSON Array formatı fark etmeksizin güvenli yükleme."""
+    txt = path.read_text(encoding="utf-8").strip()
+    if not txt:
+        return []
+    try:
+        return json.loads(txt)
+    except:
+        # satır satır dener
+        out = []
+        for line in txt.splitlines():
+            try:
+                out.append(json.loads(line.strip()))
+            except:
+                continue
+        return out
+
+def tokenize_alpha(text):
+    tokens = nltk.word_tokenize(text.lower())
+    return [lemmatizer.lemmatize(t) for t in tokens if t.isalpha() and t not in STOPWORDS]
+
+def compute_night_post_ratio(dates):
+    """created_at -> gece saatleri oranı (Istanbul timezone referans)"""
+    parsed = []
+    twitter_fmt = "%a %b %d %H:%M:%S %z %Y"
+    for d in dates:
+        try:
+            dt = pd.to_datetime(d, format=twitter_fmt, utc=True)
+        except:
+            dt = pd.to_datetime(d, utc=True, errors="coerce")
+        if dt is not None and not pd.isna(dt):
+            parsed.append(dt)
+
+    if not parsed:
+        return np.nan
+
+    hours = [dt.tz_convert("Europe/Istanbul").hour for dt in parsed]
+    night_hours = {22,23,0,1,2,3,4,5}
+    return sum(h in night_hours for h in hours) / len(hours)
+
+def linguistic_features(text):
+    feats = {}
+    if not text.strip():
+        return {k:0 for k in [
+            'word_count','char_count','avg_word_length','unique_word_ratio',
+            'uppercase_ratio','flesch_reading_ease','gunning_fog',
+            'first_person_singular_ratio','neg_emotion_word_ratio','cognitive_word_ratio'
+        ]}
+
+    words = nltk.word_tokenize(text)
+    wc = len(words)
+    chars = len(text)
+
+    feats['word_count'] = wc
+    feats['char_count'] = chars
+    feats['avg_word_length'] = np.mean([len(w) for w in words])
+    feats['unique_word_ratio'] = len(set(w.lower() for w in words)) / wc
+
+    feats['uppercase_ratio'] = sum(c.isupper() for c in text) / chars
+
+    textstat.set_lang("en_US")
+    feats['flesch_reading_ease'] = textstat.flesch_reading_ease(text)
+    feats['gunning_fog'] = textstat.gunning_fog(text)
+
+    # LIWC benzeri küçük sözlük
+    fps = r"\b(i|me|my|mine|myself)\b"
+    neg_words = set(['sad','angry','hate','lonely','miserable','depressed','anxiety','empty','hopeless'])
+    cog_words = set(['think','know','believe','understand','wonder','realize','feel'])
+
+    feats['first_person_singular_ratio'] = len(re.findall(fps, text.lower())) / wc
+    feats['neg_emotion_word_ratio'] = sum(w.lower() in neg_words for w in words) / wc
+    feats['cognitive_word_ratio'] = sum(w.lower() in cog_words for w in words) / wc
+
+    return feats
+
+# ========================= FEATURE EXTRACTION ================================
+records = []
+docs_for_lda = []
+
+print(">>> Extracting metadata features from JSON files...")
+
+for split in SPLITS:
+    for label in LABEL_DIRS:
+        folder = CLEANED_JSONS / split / label
+        for fpath in folder.glob("*.json"):
+            data = safe_load_json_lines(fpath)
+            if not data:
+                continue
+
+            texts = []
+            dates = []
+            u = None  # user profile
+
+            for tw in data:
+                if "text" in tw and isinstance(tw["text"], str):
+                    texts.append(tw["text"])
+                if "created_at" in tw:
+                    dates.append(tw["created_at"])
+                if "user" in tw:
+                    u = tw["user"]
+
+            all_text = " ".join(texts)
+            tok = tokenize_alpha(all_text)
+            docs_for_lda.append(tok)
+
+            rec = OrderedDict()
+            rec['file_id'] = fpath.stem
+            rec['split'] = split
+            rec['label'] = 1 if label == "pozitive" else 0
+            rec['tweet_count'] = len(texts)
+            rec['night_post_ratio'] = compute_night_post_ratio(dates)
+
+            # Profil özellikleri
+            if u:
+                rec['followers_count'] = u.get("followers_count", np.nan)
+                rec['friends_count'] = u.get("friends_count", np.nan)
+                rec['statuses_count'] = u.get("statuses_count", np.nan)
+                rec['favourites_count'] = u.get("favourites_count", np.nan)
+
+                # Div-by-zero önleme
+                fr = u.get("friends_count", 0)
+                rec['follower_friend_ratio'] = u.get("followers_count", 0) / fr if fr > 0 else np.nan
+            else:
+                # Boşluk doldurma
+                rec.update({'followers_count':np.nan, 'friends_count':np.nan,
+                            'statuses_count':np.nan, 'favourites_count':np.nan,
+                            'follower_friend_ratio':np.nan})
+
+            # Dilsel özellikler
+            rec.update(linguistic_features(all_text))
+
+            records.append(rec)
+
+print(f">>> Users processed: {len(records)}")
+
+# ========================= LDA (Topic Modeling) ==================================
+print(">>> Running LDA topic modeling...")
+dictionary = corpora.Dictionary(docs_for_lda)
+dictionary.filter_extremes(no_below=MIN_DOC_FREQ, no_above=NO_ABOVE)
+corpus = [dictionary.doc2bow(doc) for doc in docs_for_lda]
+
+lda_model = LdaMulticore(corpus, id2word=dictionary,
+                         num_topics=NUM_TOPICS,
+                         passes=10, workers=4, random_state=42)
+
+topic_matrix = np.zeros((len(records), NUM_TOPICS))
+for i, doc_topics in enumerate(lda_model[corpus]):
+    for t, p in doc_topics:
+        topic_matrix[i, t] = p
+
+df = pd.DataFrame(records)
+df_topics = pd.DataFrame(topic_matrix, columns=[f"topic_{i}" for i in range(NUM_TOPICS)])
+df = pd.concat([df, df_topics], axis=1)
+
+# Save topic words
+topic_terms = []
+for i in range(NUM_TOPICS):
+    terms = lda_model.show_topic(i, topn=15)
+    topic_terms.append({"topic_id": i, "top_words": ", ".join(w for w, _ in terms)})
+pd.DataFrame(topic_terms).to_csv(OUTPUT_DIR / "lda_topic_terms.csv", index=False)
+
+# ========================= SAVE FEATURES ====================================
+df.to_csv(OUTPUT_DIR / "user_level_features.csv", index=False)
+print(">>> Saved user_level_features.csv")
+
+# ========================= ANALYSIS PLOTS ====================================
+numeric = df.select_dtypes(include=[np.number])
+
+corr = numeric.corr()
+plt.figure(figsize=(20,16))
+sns.heatmap(corr, cmap="coolwarm", center=0)
+plt.title("Feature Correlation Heatmap")
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "corr_heatmap.png", dpi=200)
+plt.close()
+print(">>> Saved corr_heatmap.png")
+
+mi_s = None
+try:
+    X = numeric.drop(columns=["label"]).fillna(0)
+    y = numeric["label"]
+    mi = mutual_info_classif(X, y, random_state=42)
+    mi_s = pd.Series(mi, index=X.columns).sort_values(ascending=False)
+    mi_s.to_csv(OUTPUT_DIR / "mutual_info_scores.csv")
+    print(">>> Saved mutual_info_scores.csv")
+except Exception as e:
+    print(f">>> MI skipped due to: {e}")
+
+if mi_s is not None:
+    topn = mi_s.head(20)
+    plt.figure(figsize=(10,6))
+    topn.plot(kind='bar')
+    plt.title("Top 20 Metadata Feature Importances (MI)")
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "label_feature_importance.png")
+    plt.close()
+    print(">>> Saved label_feature_importance.png")
+
+# ========================= LDA VIS ====================================
+lda_vis = gensimvis.prepare(lda_model, corpus, dictionary)
+pyLDAvis.save_html(lda_vis, str(OUTPUT_DIR / "lda_vis.html"))
+
+print(">>> Saved lda_vis.html")
+
+print("\n🎯 Completed successfully! Outputs are ready in:", OUTPUT_DIR)
