@@ -1,1 +1,64 @@
+import json
+from pathlib import Path
 
+
+POS_IN = Path()
+NEG_IN = Path()
+
+def count_stats(directory_path: Path):
+    
+    if not directory_path.is_dir():
+        print(f"HATA: '{directory_path}' dizini bulunamadı!")
+        return 0, 0
+        
+  
+    user_files = list(directory_path.glob('*.json'))
+    user_count = len(user_files)
+    tweet_count = 0
+    
+    print(f"'{directory_path.name}' dizininde {user_count} kullanıcı dosyası bulundu. Tweet'ler sayılıyor...")
+    
+   
+    for file_path in user_files:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+
+                num_lines = sum(1 for line in f)
+                tweet_count += num_lines
+        except Exception as e:
+            print(f"Uyarı: {file_path.name} dosyası okunurken bir hata oluştu: {e}")
+            
+    return user_count, tweet_count
+
+
+print("Veri seti analizi başlıyor...")
+
+
+pos_user_count, pos_tweet_count = count_stats(POS_IN)
+
+
+neg_user_count, neg_tweet_count = count_stats(NEG_IN)
+
+
+print("\n" + "="*30)
+print("      VERİ SETİ ÖZETİ")
+print("="*30)
+
+print("\nPozitif Sınıf:")
+
+print(f"  - Toplam Kullanıcı Sayısı: {pos_user_count:_d}")
+print(f"  - Toplam Tweet Sayısı    : {pos_tweet_count:_d}")
+
+print("\nNegatif Sınıf:")
+print(f"  - Toplam Kullanıcı Sayısı: {neg_user_count:_d}")
+print(f"  - Toplam Tweet Sayısı    : {neg_tweet_count:_d}")
+
+print("\n" + "-"*30)
+
+total_users = pos_user_count + neg_user_count
+total_tweets = pos_tweet_count + neg_tweet_count
+
+print("\nGenel Toplam:")
+print(f"  - Toplam Kullanıcı Sayısı: {total_users:_d}")
+print(f"  - Toplam Tweet Sayısı    : {total_tweets:_d}")
+print("="*30)
